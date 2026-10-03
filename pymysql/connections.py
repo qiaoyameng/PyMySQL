@@ -12,6 +12,7 @@ import struct
 import sys
 import traceback
 import warnings
+import weakref
 
 from . import VERSION_STRING, _auth, converters, err
 from .charset import charset_by_id, charset_by_name
@@ -342,6 +343,7 @@ class Connection:
         self._result = None
         self._affected_rows = 0
         self.host_info = "Not connected"
+        self._cursors = weakref.WeakSet()
 
         # specified autocommit mode. None means use server default.
         self.autocommit_mode = autocommit
@@ -568,8 +570,53 @@ class Connection:
             or :py:class:`SSDictCursor`.
         """
         if cursor:
-            return cursor(self)
-        return self.cursorclass(self)
+            c = cursor(self)
+        else:
+            c = self.cursorclass(self)
+        self._cursors.add(c)
+        return c
+
+    def reset_session(self):
+        """
+        Reset the server-side session and make the connection reusable.
+
+        Send COM_RESET_CONNECTION to roll back any transaction and clear
+        session state (temporary tables, user variables, prepared
+        statements, ...), then restore the charset, autocommit mode and
+        init_command configured when the connection was created.
+
+        Cursors created before the reset are invalidated; the connection
+        object itself stays usable. If the reset or the reconfiguration
+        fails, the connection is closed so a half-initialized session is
+        never returned to a pool.
+
+        :raise Error: If the connection is already closed.
+        """
+        if self._sock is None:
+            raise err.Error("Already closed")
+        # The server-side session state these cursors refer to is gone
+        # after the reset, so they can never be used again.
+        for c in self._cursors:
+            c.connection = None
+        self._cursors.clear()
+        try:
+            # _execute_command() finishes a pending unbuffered result and
+            # reads remaining result sets before sending the command, so
+            # the reset response can't be mistaken for a packet of an old
+            # query.
+            self._execute_command(COMMAND.COM_RESET_CONNECTION, b"")
+            self._read_ok_packet()
+            # Restore the session configuration chosen at connect time.
+            self.set_character_set(self.charset, self.collation)
+            if self.init_command is not None:
+                c = self.cursor()
+                c.execute(self.init_command)
+                c.close()
+            if self.autocommit_mode is not None:
+                self.autocommit(self.autocommit_mode)
+        except BaseException:
+            self._force_close()
+            raise
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
