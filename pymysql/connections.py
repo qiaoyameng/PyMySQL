@@ -91,6 +91,146 @@ def _lenenc_int(i):
         )
 
 
+def _encode_query_attribute_value(value, encoding):
+    """Encode a single query attribute value as sent with COM_QUERY.
+
+    Only ``str``, ``bytes``, ``int``, ``float`` and ``None`` are supported,
+    matching the types that MySQL accepts for query attributes.
+
+    Returns ``(type_code, is_unsigned, value_bytes)``.  The type itself is
+    always written later as two bytes (type code plus an unsigned flag), the
+    same way parameter types are encoded in COM_STMT_EXECUTE.
+    """
+    if value is None:
+        return FIELD_TYPE.NULL, False, b""
+    if isinstance(value, bool):
+        return FIELD_TYPE.TINY, False, struct.pack("<b", int(value))
+    if isinstance(value, int):
+        if -(1 << 63) <= value < 1 << 63:
+            return FIELD_TYPE.LONGLONG, False, struct.pack("<q", value)
+        if value < 1 << 64:
+            return FIELD_TYPE.LONGLONG, True, struct.pack("<Q", value)
+        raise TypeError("integer query attribute is out of range: %r" % value)
+    if isinstance(value, float):
+        return FIELD_TYPE.DOUBLE, False, struct.pack("<d", value)
+    if isinstance(value, str):
+        data = value.encode(encoding)
+        return FIELD_TYPE.VAR_STRING, False, _lenenc_int(len(data)) + data
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+        return FIELD_TYPE.BLOB, False, _lenenc_int(len(data)) + data
+    raise TypeError(
+        "unsupported type %s for query attribute %r"
+        % (type(value).__name__, value)
+    )
+
+
+def _check_supported_query_attribute_value(value):
+    """Raise TypeError for values that cannot be sent as query attributes."""
+    if value is None or isinstance(
+        value, (str, bytes, bytearray, bool, int, float)
+    ):
+        return
+    raise TypeError(
+        "unsupported type %s for query attribute %r"
+        % (type(value).__name__, value)
+    )
+
+
+def _normalize_query_attributes(attributes):
+    """Turn a mapping or a sequence of (name, value) pairs into a list.
+
+    Duplicate names are rejected here so that the error is raised before
+    anything is sent to the server.
+    """
+    if attributes is None:
+        return None
+    if isinstance(attributes, dict):
+        items = list(attributes.items())
+    else:
+        try:
+            items = list(attributes)
+        except TypeError:
+            raise TypeError("query attributes must be a mapping or a sequence")
+    normalized = []
+    seen = set()
+    for item in items:
+        try:
+            name, value = item
+        except (TypeError, ValueError):
+            raise TypeError(
+                "every query attribute must be a (name, value) pair"
+            )
+        if not isinstance(name, str):
+            raise TypeError("query attribute names must be strings")
+        if name in seen:
+            raise ValueError("duplicate query attribute name: %r" % name)
+        seen.add(name)
+        normalized.append((name, value))
+    return normalized
+
+
+def _merge_query_attributes(defaults, attributes):
+    """Resolve effective attributes for one query.
+
+    ``attributes`` (per-query) takes precedence over ``defaults``
+    (connection-level).  An empty per-query mapping cancels the defaults.
+    """
+    if not attributes:
+        return []
+    merged = {name: value for name, value in defaults}
+    merged.update(attributes)
+    return list(merged.items())
+
+
+def _encode_query_attributes_block(attributes, encoding):
+    """Encode the query-attributes block prepended to a COM_QUERY packet.
+
+    When the server negotiated CLIENT_QUERY_ATTRIBUTES this block is sent
+    with *every* COM_QUERY, even when there are no attributes.  Layout (all
+    integers length-encoded unless noted)::
+
+        parameter_count (= 0, text protocol has no bound parameters)
+        new_params_bound (= 0 when there are no attributes, then done)
+        attribute_count
+        null_bitmap                    ((count + 7) // 8 raw bytes)
+        type_code[1], unsigned_flag[1] (two raw bytes per attribute)
+        name_lenenc, name              (per attribute)
+        value                          (per attribute, NULL omitted)
+
+    See:
+    https://dev.mysql.com/doc/internals/en/com-query.html
+    """
+    count = len(attributes)
+    data = _lenenc_int(0)  # parameters
+    if count == 0:
+        data += _lenenc_int(0)  # new_params_bound; nothing more follows
+        return data
+    data += _lenenc_int(1)  # new_params_bound
+    data += _lenenc_int(count)
+
+    null_bitmap = bytearray((count + 7) // 8)
+    encoded = []
+    for index, (name, value) in enumerate(attributes):
+        type_code, is_unsigned, value_bytes = _encode_query_attribute_value(
+            value, encoding
+        )
+        name_bytes = name.encode(encoding)
+        encoded.append(
+            struct.pack("<BB", type_code, 0x80 if is_unsigned else 0)
+            + _lenenc_int(len(name_bytes))
+            + name_bytes
+            + value_bytes
+        )
+        if value is None:
+            null_bitmap[index // 8] |= 1 << (index % 8)
+
+    data += bytes(null_bitmap)
+    for item in encoded:
+        data += item
+    return data
+
+
 class Connection:
     """
     Representation of a socket with a mysql server.
@@ -161,6 +301,11 @@ class Connection:
     :param binary_prefix: **DEPRECATED**
     :param compress: Not supported.
     :param named_pipe: Not supported.
+    :param query_attributes: Default query attributes sent with every query as
+        a mapping or a sequence of ``(name, value)`` pairs. Supported values are
+        ``str``, ``bytes``, ``int``, ``float`` and ``None``. Requires a server
+        supporting ``CLIENT_QUERY_ATTRIBUTES`` (MySQL 8.0.23 or newer).
+        Per-query ``query_attributes`` replace these defaults.
     :param db: **DEPRECATED** Alias for database.
     :param passwd: **DEPRECATED** Alias for password.
 
@@ -215,6 +360,7 @@ class Connection:
         ssl_verify_identity=None,
         compress=None,  # not supported
         named_pipe=None,  # not supported
+        query_attributes=None,
         passwd=None,  # deprecated
         db=None,  # deprecated
     ):
@@ -357,6 +503,13 @@ class Connection:
         self.max_allowed_packet = max_allowed_packet
         self._auth_plugin_map = auth_plugin_map or {}
         self.server_public_key = server_public_key
+        # Keep an independent copy so later mutation of the caller's object
+        # never affects this connection. Validation happens eagerly, before
+        # the first packet is sent.
+        default_query_attributes = _normalize_query_attributes(query_attributes)
+        for _name, value in default_query_attributes or []:
+            _check_supported_query_attribute_value(value)
+        self._default_query_attributes = default_query_attributes
 
         self._connect_attrs = {
             "_client_name": "pymysql",
@@ -572,12 +725,38 @@ class Connection:
         return self.cursorclass(self)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
-    def query(self, sql, unbuffered=False):
+    def query(self, sql, unbuffered=False, query_attributes=None):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
-        self._execute_command(COMMAND.COM_QUERY, sql)
+        # Normalize/validate before any network access so that bad input
+        # raises without leaving the connection in an unknown state.
+        defaults = self._default_query_attributes or []
+        if query_attributes is None:
+            attributes = list(defaults)
+        else:
+            # Any explicit value, including an empty mapping, replaces the
+            # connection-level defaults for this query only.
+            attributes = _merge_query_attributes(
+                defaults, _normalize_query_attributes(query_attributes)
+            )
+        if attributes:
+            for _name, value in attributes:
+                _check_supported_query_attribute_value(value)
+            if not (self.server_capabilities & CLIENT.QUERY_ATTRIBUTES):
+                raise err.NotSupportedError(
+                    "server does not support CLIENT_QUERY_ATTRIBUTES",
+                )
+        # The attributes block contains the parameter counters.  When there
+        # are no attributes, _execute_command() emits the empty counters
+        # prefix itself whenever the capability was negotiated.
+        prefix = (
+            _encode_query_attributes_block(attributes, self.encoding)
+            if attributes
+            else b""
+        )
+        self._execute_command(COMMAND.COM_QUERY, sql, prefix=prefix)
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
         return self._affected_rows
 
@@ -866,7 +1045,7 @@ class Connection:
         else:
             return 0
 
-    def _execute_command(self, command, sql):
+    def _execute_command(self, command, sql, prefix=b""):
         """
         :raise InterfaceError: If the connection is closed.
         :raise ValueError: If no username was specified.
@@ -887,12 +1066,24 @@ class Connection:
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
 
-        packet_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
+        if (
+            command == COMMAND.COM_QUERY
+            and not prefix
+            and self.server_capabilities & CLIENT.QUERY_ATTRIBUTES
+        ):
+            # Once CLIENT_QUERY_ATTRIBUTES is negotiated, the server expects
+            # the two length-encoded parameter counters before every query,
+            # including internal queries that carry no attributes.
+            prefix = b"\x00\x00"
+
+        # +1 is for command.  ``prefix`` carries the query-attributes block
+        # (empty for ordinary queries, preserving the original packet).
+        packet_size = min(MAX_PACKET_LEN, len(prefix) + len(sql) + 1)
 
         # tiny optimization: build first packet manually instead of
         # calling self..write_packet()
-        prelude = struct.pack("<iB", packet_size, command)
-        packet = prelude + sql[: packet_size - 1]
+        prelude = struct.pack("<iB", packet_size, command) + prefix
+        packet = prelude + sql[: packet_size - 1 - len(prefix)]
         self._write_bytes(packet)
         if DEBUG:
             dump_packet(packet)
@@ -901,7 +1092,7 @@ class Connection:
         if packet_size < MAX_PACKET_LEN:
             return
 
-        sql = sql[packet_size - 1 :]
+        sql = sql[packet_size - 1 - len(prefix) :]
         while True:
             packet_size = min(MAX_PACKET_LEN, len(sql))
             self.write_packet(sql[:packet_size])
@@ -927,6 +1118,10 @@ class Connection:
         # also advertises SSL support.
         # _do_ssl is set here and checked below for sha256_password auth.
         client_flags = self.client_flag
+        # The query-attributes capability is only usable when the server
+        # advertises it too; strip it from the handshake otherwise.
+        if not (self.server_capabilities & CLIENT.QUERY_ATTRIBUTES):
+            client_flags &= ~CLIENT.QUERY_ATTRIBUTES
         if self.ssl:
             if self.server_capabilities & CLIENT.SSL:
                 # SSL upgrade: include CLIENT.SSL flag and wrap the socket.
