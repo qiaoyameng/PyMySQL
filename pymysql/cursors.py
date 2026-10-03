@@ -147,7 +147,7 @@ class Cursor:
 
         return self._mogrify(query, args)
 
-    def execute(self, query, args=None):
+    def execute(self, query, args=None, query_attributes=None):
         """Execute a query.
 
         :param query: Query to execute.
@@ -155,6 +155,11 @@ class Cursor:
 
         :param args: Parameters used with query. (optional)
         :type args: tuple, list or dict
+
+        :param query_attributes: Query attributes sent with this COM_QUERY,
+            replacing connection-level defaults for this query only.  Pass an
+            empty mapping to suppress the connection defaults. (optional)
+        :type query_attributes: mapping or iterable of (name, value) pairs
 
         :return: Number of affected rows.
         :rtype: int
@@ -167,7 +172,7 @@ class Cursor:
 
         if args is not None:
             query = self._mogrify(query, args)
-        result = self._query(query)
+        result = self._query(query, query_attributes=query_attributes)
         self._executed = query
         return result
 
@@ -329,10 +334,10 @@ class Cursor:
             raise IndexError("out of range")
         self.rownumber = r
 
-    def _query(self, q):
+    def _query(self, q, query_attributes=None):
         conn = self._get_db()
         self._clear_result()
-        conn.query(q)
+        conn.query(q, query_attributes=query_attributes)
         self._do_get_result()
         return self.rowcount
 
@@ -430,10 +435,10 @@ class SSCursor(Cursor):
 
     __del__ = close
 
-    def _query(self, q):
+    def _query(self, q, query_attributes=None):
         conn = self._get_db()
         self._clear_result()
-        conn.query(q, unbuffered=True)
+        conn.query(q, unbuffered=True, query_attributes=query_attributes)
         self._do_get_result()
         return self.rowcount
 

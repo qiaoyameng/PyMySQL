@@ -1,5 +1,15 @@
 # Changes
 
+## Unreleased
+
+* Added support for MySQL query attributes (CLIENT_QUERY_ATTRIBUTES).
+  Attributes can be passed per query via
+  ``cursor.execute(sql, args, query_attributes=...)`` or
+  ``connection.query(sql, query_attributes=...)``, or set for every query of a
+  connection with the ``query_attributes`` connection option.
+  Supported value types are ``None``, ``bool``, ``int``, ``float``, ``str`` and
+  ``bytes``.  MySQL 8.0.23 or later is required.
+
 ## v1.2.3
 
 Release date: 2026-09-17

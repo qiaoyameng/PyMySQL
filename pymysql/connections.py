@@ -4,8 +4,10 @@
 # https://dev.mysql.com/doc/refman/5.5/en/error-handling.html
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import errno
+import math
 import os
 import socket
 import struct
@@ -91,6 +93,115 @@ def _lenenc_int(i):
         )
 
 
+# Python types supported as COM_QUERY attribute values.  bool is checked
+# separately because it is a subclass of int.
+_QUERY_ATTRIBUTE_TYPES = (bool, int, float, str, bytes, bytearray)
+_QUERY_ATTRIBUTE_INT_MIN = -(2**63)
+_QUERY_ATTRIBUTE_INT_MAX = 2**64 - 1
+
+
+def _normalize_query_attributes(attrs, encoding):
+    """Validate *attrs* and return a tuple of ``(name_bytes, value)`` pairs.
+
+    *attrs* may be None, a mapping or an iterable of ``(name, value)`` pairs.
+    A copy is returned; callers' mappings are never retained or mutated.
+
+    Names must be str or bytes, must not repeat, and values must be one of
+    None, bool, int, float, str or bytes.
+    """
+    if attrs is None:
+        return ()
+    if isinstance(attrs, collections.abc.Mapping):
+        items = attrs.items()
+    else:
+        items = attrs
+
+    normalized = []
+    seen = set()
+    for pair in items:
+        try:
+            name, value = pair
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "query attributes must be a mapping or an iterable of "
+                "(name, value) pairs"
+            ) from exc
+
+        if isinstance(name, str):
+            name_bytes = name.encode(encoding)
+        elif isinstance(name, bytes):
+            name_bytes = name
+        else:
+            raise TypeError("query attribute name must be str or bytes")
+
+        if name_bytes in seen:
+            raise ValueError(f"duplicate query attribute name: {name!r}")
+        seen.add(name_bytes)
+
+        if value is not None and not isinstance(value, _QUERY_ATTRIBUTE_TYPES):
+            raise TypeError(
+                f"unsupported query attribute value type: {type(value).__name__}"
+            )
+
+        normalized.append((name_bytes, value))
+    return tuple(normalized)
+
+
+def _encode_query_attribute_value(value):
+    """Encode one query attribute value for the binary protocol."""
+    if value is None:
+        return FIELD_TYPE.NULL, 0, b""
+    if isinstance(value, bool):
+        return FIELD_TYPE.TINY, 0, struct.pack("<B", int(value))
+    if isinstance(value, int):
+        if not _QUERY_ATTRIBUTE_INT_MIN <= value <= _QUERY_ATTRIBUTE_INT_MAX:
+            raise ValueError("integer query attribute value is out of 64-bit range")
+        unsigned = value >= 0
+        payload = struct.pack("<Q" if unsigned else "<q", value)
+        return FIELD_TYPE.LONGLONG, int(unsigned), payload
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("float query attribute value must be finite")
+        return FIELD_TYPE.DOUBLE, 0, struct.pack("<d", value)
+    if isinstance(value, str):
+        data = value.encode("utf-8")
+        return FIELD_TYPE.STRING, 0, _lenenc_int(len(data)) + data
+    # bytes and bytearray
+    data = bytes(value)
+    return FIELD_TYPE.BLOB, 0, _lenenc_int(len(data)) + data
+
+
+def _encode_query_attributes(attrs):
+    """Build the CLIENT_QUERY_ATTRIBUTES parameter block for COM_QUERY.
+
+    *attrs* is a tuple produced by :func:`_normalize_query_attributes`.
+    Layout (see mysql_server_rpl_parse_parameter_block):
+    parameter_set_count, NULL bitmap, new-params-bound flag, all parameter
+    types, all names, then all values.
+    """
+    count = len(attrs)
+    null_bitmap = bytearray((count + 7) // 8)
+    types = bytearray()
+    values = []
+
+    for index, (_name, value) in enumerate(attrs):
+        field_type, unsigned, payload = _encode_query_attribute_value(value)
+        if value is None:
+            null_bitmap[index // 8] |= 1 << (index % 8)
+        types += struct.pack("<HB", field_type, unsigned)
+        values.append(payload)
+
+    block = _lenenc_int(1 if count else 0)  # parameter set count (one COM_QUERY)
+    block += bytes(null_bitmap)
+    block += b"\x01"  # parameters are newly bound, so type/name blocks follow.
+    block += bytes(types)  # one 3-byte type entry per attribute
+    for name, _value in attrs:
+        block += _lenenc_int(len(name)) + name
+    for payload in values:
+        block += payload
+    return block
+
+
 class Connection:
     """
     Representation of a socket with a mysql server.
@@ -148,6 +259,11 @@ class Connection:
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
     :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
+    :param query_attributes: Default query attributes sent with every COM_QUERY
+        when the server supports the CLIENT_QUERY_ATTRIBUTES capability.
+        A mapping or an iterable of ``(name, value)`` pairs; supported values
+        are None, bool, int, float, str and bytes. Per-query ``query_attributes``
+        replace these defaults for that query only.
     :param max_allowed_packet: Max size of packet sent to server in bytes. (default: 16MB)
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
@@ -196,6 +312,7 @@ class Connection:
         read_default_group=None,
         autocommit=False,
         local_infile=False,
+        query_attributes=None,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
         auth_plugin_map=None,
@@ -366,6 +483,12 @@ class Connection:
 
         if program_name:
             self._connect_attrs["program_name"] = program_name
+
+        # Connection-level default query attributes.  Kept as a private tuple
+        # so callers cannot mutate it after construction.
+        self._query_attributes = _normalize_query_attributes(
+            query_attributes, self.encoding
+        )
 
         if defer_connect:
             self._sock = None
@@ -572,11 +695,23 @@ class Connection:
         return self.cursorclass(self)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
-    def query(self, sql, unbuffered=False):
+    def query(self, sql, unbuffered=False, query_attributes=None):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
+        if query_attributes is None:
+            attrs = self._query_attributes
+        else:
+            attrs = _normalize_query_attributes(query_attributes, self.encoding)
+        if attrs:
+            if not (self.server_capabilities & CLIENT.QUERY_ATTRIBUTES):
+                raise err.NotSupportedError(
+                    "Server does not support query attributes (CLIENT_QUERY_ATTRIBUTES)"
+                )
+            # The attribute block is prepended to the query text inside the
+            # single COM_QUERY packet; it is never visible in the SQL.
+            sql = _encode_query_attributes(attrs) + sql
         self._execute_command(COMMAND.COM_QUERY, sql)
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
         return self._affected_rows
@@ -700,6 +835,13 @@ class Connection:
 
             self._get_server_information()
             self._request_authentication()
+
+            if self._query_attributes and not (
+                self.server_capabilities & CLIENT.QUERY_ATTRIBUTES
+            ):
+                raise err.NotSupportedError(
+                    "Server does not support query attributes (CLIENT_QUERY_ATTRIBUTES)"
+                )
 
             # Send "SET NAMES" query on init for:
             # - Ensure charset (and collation) is set to the server.
