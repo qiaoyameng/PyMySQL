@@ -173,6 +173,7 @@ class Connection:
     _auth_plugin_name = ""
     _closed = False
     _secure = False
+    _stmt_generation = 0
 
     def __init__(
         self,
@@ -571,6 +572,22 @@ class Connection:
             return cursor(self)
         return self.cursorclass(self)
 
+    def prepare(self, sql):
+        """
+        Prepare a SQL statement on the server and return a handle that can
+        be executed multiple times with different parameters.
+
+        The returned statement is bound to this connection generation: it
+        becomes invalid once the connection is closed or re-established.
+        Call ``close()`` on the statement to release it on the server.
+
+        :param sql: SQL statement with ``?`` parameter placeholders.
+        :return: :py:class:`pymysql.prepared.PreparedStatement`
+        """
+        from .prepared import PreparedStatement
+
+        return PreparedStatement.prepare(self, sql)
+
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
         # if DEBUG:
@@ -662,6 +679,8 @@ class Connection:
 
     def connect(self, sock=None):
         self._closed = False
+        # Invalidate prepared statements created before (re)connecting.
+        self._stmt_generation += 1
         try:
             if sock is None:
                 if self.unix_socket:
