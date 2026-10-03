@@ -148,6 +148,15 @@ class Connection:
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
     :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
+    :param local_infile_callback: Optional callable that provides the data for
+        LOAD DATA LOCAL INFILE from memory instead of the local filesystem.
+        It is called with the file name (bytes) requested by the server and
+        must return an iterable of bytes chunks, or None to refuse the
+        request. Each chunk must be non-empty and at most max_allowed_packet
+        bytes long. If the returned object has a close() method, it is called
+        when the upload finishes or fails. Only used when local_infile is
+        also enabled; when set, the path requested by the server is never
+        opened directly. (default: None)
     :param max_allowed_packet: Max size of packet sent to server in bytes. (default: 16MB)
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
@@ -196,6 +205,7 @@ class Connection:
         read_default_group=None,
         autocommit=False,
         local_infile=False,
+        local_infile_callback=None,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
         auth_plugin_map=None,
@@ -235,6 +245,7 @@ class Connection:
         self._local_infile = bool(local_infile)
         if self._local_infile:
             client_flag |= CLIENT.LOCAL_FILES
+        self._local_infile_callback = local_infile_callback
 
         if read_default_group and not read_default_file:
             if sys.platform.startswith("win"):
@@ -1340,13 +1351,31 @@ class MySQLResult:
             )
         load_packet = LoadLocalPacketWrapper(first_packet)
         try:
-            _send_local_file(load_packet.filename, conn)
-        finally:
-            # send the empty packet to signify we are done sending data
-            conn.write_packet(b"")
-            ok_packet = conn._read_packet()
-            # If an error occurs while sending the file, exit here without handling
-            # the OK packet.
+            if conn._local_infile_callback is not None:
+                _send_local_infile_from_callback(load_packet.filename, conn)
+            else:
+                _send_local_file(load_packet.filename, conn)
+        except BaseException:
+            # The upload failed. Try to finish the LOAD DATA exchange so the
+            # connection stays usable for the next query. If the exchange
+            # can't be finished cleanly, drop the connection instead of
+            # leaking a half-finished import state.
+            try:
+                # send the empty packet to signify we are done sending data
+                conn.write_packet(b"")
+                conn._read_packet()
+            except err.MySQLError:
+                # The server answered the terminating packet with an error
+                # (e.g. the partial import was rejected). The exchange is
+                # complete; report the original failure.
+                pass
+            except BaseException:
+                conn._force_close()
+            raise
+
+        # send the empty packet to signify we are done sending data
+        conn.write_packet(b"")
+        ok_packet = conn._read_packet()
 
         if not ok_packet.is_ok_packet():
             raise err.OperationalError(
@@ -1506,3 +1535,39 @@ def _send_local_file(filename: str, conn: Connection):
             ER.FILE_NOT_FOUND,
             f"Can't open file '{filename}': {e}",
         )
+
+
+def _send_local_infile_from_callback(filename: bytes, conn: Connection):
+    """Send LOAD DATA LOCAL INFILE data supplied by the user's callback.
+
+    The callback receives the file name requested by the server and must
+    return an iterable of bytes chunks, or None to refuse the request. The
+    requested path is never opened directly in this mode.
+    """
+    source = conn._local_infile_callback(filename)
+    if source is None:
+        raise err.OperationalError(
+            CR.CR_UNKNOWN_ERROR,
+            f"LOAD DATA LOCAL INFILE callback refused to provide '{filename}'",
+        )
+
+    max_chunk_size = min(conn.max_allowed_packet, MAX_PACKET_LEN)
+    try:
+        for chunk in source:
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise err.OperationalError(
+                    CR.CR_UNKNOWN_ERROR,
+                    "LOAD DATA LOCAL INFILE callback must yield bytes chunks, "
+                    f"got {type(chunk).__name__}",
+                )
+            if not 0 < len(chunk) <= max_chunk_size:
+                raise err.OperationalError(
+                    CR.CR_UNKNOWN_ERROR,
+                    "LOAD DATA LOCAL INFILE callback chunk size must be "
+                    f"between 1 and {max_chunk_size} bytes, got {len(chunk)}",
+                )
+            conn.write_packet(bytes(chunk))
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
