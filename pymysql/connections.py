@@ -148,6 +148,12 @@ class Connection:
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
     :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
+    :param local_infile_handler: Optional callable that provides the data for
+        "LOAD DATA LOCAL INFILE" without reading from the local filesystem.
+        Only used when local_infile is True. It is called with the file name
+        requested by the server and must return an iterable of bytes chunks,
+        or None to refuse the request. When set, the file name sent by the
+        server is never opened from the local filesystem. (default: None)
     :param max_allowed_packet: Max size of packet sent to server in bytes. (default: 16MB)
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
@@ -196,6 +202,7 @@ class Connection:
         read_default_group=None,
         autocommit=False,
         local_infile=False,
+        local_infile_handler=None,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
         auth_plugin_map=None,
@@ -235,6 +242,7 @@ class Connection:
         self._local_infile = bool(local_infile)
         if self._local_infile:
             client_flag |= CLIENT.LOCAL_FILES
+        self._local_infile_handler = local_infile_handler
 
         if read_default_group and not read_default_file:
             if sys.platform.startswith("win"):
@@ -1340,13 +1348,26 @@ class MySQLResult:
             )
         load_packet = LoadLocalPacketWrapper(first_packet)
         try:
-            _send_local_file(load_packet.filename, conn)
-        finally:
+            if conn._local_infile_handler is not None:
+                _send_local_data(load_packet.filename, conn)
+            else:
+                _send_local_file(load_packet.filename, conn)
+        except Exception:
+            if conn._closed:
+                # The connection is already broken, so the import state
+                # cannot be finished safely. Nothing is left for the next
+                # query because the connection is unusable anyway.
+                raise
+            # The protocol is still in a sane state: send the empty packet
+            # to signify we are done sending data and read the final server
+            # response so the import state is not leaked to the next query.
+            conn.write_packet(b"")
+            conn._read_packet()
+            raise
+        else:
             # send the empty packet to signify we are done sending data
             conn.write_packet(b"")
             ok_packet = conn._read_packet()
-            # If an error occurs while sending the file, exit here without handling
-            # the OK packet.
 
         if not ok_packet.is_ok_packet():
             raise err.OperationalError(
@@ -1506,3 +1527,43 @@ def _send_local_file(filename: str, conn: Connection):
             ER.FILE_NOT_FOUND,
             f"Can't open file '{filename}': {e}",
         )
+
+
+def _send_local_data(filename: bytes, conn: Connection):
+    """Send data packets provided by the ``local_infile_handler`` callback.
+
+    The callback mode never falls back to opening the server-provided
+    file name from the local filesystem.
+    """
+    handler = conn._local_infile_handler
+    source = handler(filename.decode(conn.encoding, "surrogateescape"))
+    if source is None:
+        raise err.OperationalError(
+            ER.FILE_NOT_FOUND,
+            "local_infile_handler refused to provide data "
+            f"for '{filename!r}'",
+        )
+    try:
+        for chunk in source:
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise TypeError(
+                    "local_infile_handler must yield bytes-like chunks, "
+                    f"got {type(chunk).__name__}"
+                )
+            chunk = bytes(chunk)
+            if not chunk:
+                # An empty packet terminates the transfer, so empty chunks
+                # must not be sent in the middle of the stream.
+                continue
+            if len(chunk) > conn.max_allowed_packet:
+                raise err.OperationalError(
+                    ER.NET_PACKET_TOO_LARGE,
+                    f"local_infile_handler yielded a chunk of {len(chunk)} "
+                    "bytes, larger than max_allowed_packet "
+                    f"({conn.max_allowed_packet})",
+                )
+            conn.write_packet(chunk)
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
