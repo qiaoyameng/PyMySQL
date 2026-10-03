@@ -9,6 +9,12 @@ Cursor Objects
                      IntegrityError, InternalError, NotSupportedError,
                      OperationalError, ProgrammingError, Warning
 
+.. autoclass:: ResultSetIterator
+   :members:
+
+.. autoclass:: ResultSet
+   :members:
+
 .. autoclass:: SSCursor
    :members:
 

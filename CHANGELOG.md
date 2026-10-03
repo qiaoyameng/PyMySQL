@@ -1,5 +1,15 @@
 # Changes
 
+## Unreleased
+
+Added `Cursor.iter_result_sets()` for explicitly iterating the multiple
+result sets returned by stored procedures and multi-statement queries.
+Each result set exposes its metadata (`description`, `rowcount` /
+`affected_rows`, `warning_count`, `more_results`) and a lazy row iterator;
+rows are read from the socket on demand.  Advancing past a partially read
+result set drains its remaining rows, and the returned context manager
+leaves the connection ready for the next query.
+
 ## v1.2.3
 
 Release date: 2026-09-17

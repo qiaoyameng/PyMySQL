@@ -807,6 +807,10 @@ class Connection:
         if packet.is_error_packet():
             if self._result is not None and self._result.unbuffered_active is True:
                 self._result.unbuffered_active = False
+                # The statement is finished with an error; detach the
+                # result so its destructor does not keep reading a socket
+                # that now belongs to the next command.
+                self._result.connection = None
             packet.raise_for_error()
         return packet
 
@@ -1378,7 +1382,15 @@ class MySQLResult:
             return
 
         # EOF
-        packet = self.connection._read_packet()
+        try:
+            packet = self.connection._read_packet()
+        except BaseException:
+            # Whether the connection broke or the server ended the
+            # statement with an error packet, this result set has no more
+            # readable rows; don't let the destructor keep reading.
+            self.unbuffered_active = False
+            self.connection = None
+            raise
         if self._check_packet_is_eof(packet):
             self.unbuffered_active = False
             self.connection = None
@@ -1487,6 +1499,13 @@ class MySQLResult:
         eof_packet = self.connection._read_packet()
         assert eof_packet.is_eof_packet(), "Protocol error, expecting EOF"
         self.description = tuple(description)
+        # The EOF packet after the column descriptors already carries the
+        # warning count and the server's more-results status.  Remember it
+        # so unbuffered result sets expose that metadata before their rows
+        # (and the row-data EOF packet) have been read.
+        header_eof = EOFPacketWrapper(eof_packet)
+        self.warning_count = header_eof.warning_count
+        self.has_next = header_eof.has_next
 
 
 def _send_local_file(filename: str, conn: Connection):

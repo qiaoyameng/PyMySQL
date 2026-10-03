@@ -21,6 +21,270 @@ def _backquote_escape(s):
     return s.replace("`", "``")
 
 
+class ResultSet:
+    """Metadata and lazy rows of a single result set.
+
+    Instances are produced by :meth:`Cursor.iter_result_sets`; they must not
+    be created directly.
+
+    Each object exposes this result set's metadata and a lazy iterator over
+    its rows.  Rows are read from the socket one packet at a time, so result
+    sets with many rows do not need to fit in memory.
+
+    A ``ResultSet`` is consumed once: after the owning
+    :class:`ResultSetIterator` advances to the next result set, iterating an
+    older result set raises :class:`~pymysql.err.ProgrammingError`; this
+    prevents two row iterators from interleaving reads on the same socket.
+    """
+
+    def __init__(self, stream, result):
+        self._stream = stream
+        self._result = result
+        self._cursor = stream._cursor
+        self._consumed = False
+        self._superseded = False
+
+        self.description = result.description
+        self.affected_rows = result.affected_rows
+        # The MySQL protocol has no row count for an unbuffered SELECT until
+        # its EOF packet is seen.  Follow the DB-API convention of -1 while
+        # the total is unknown and expose the final count once it is.
+        self.rowcount = -1 if result.unbuffered_active else result.affected_rows
+        self.warning_count = result.warning_count
+        self.lastrowid = result.insert_id
+        self.more_results = bool(result.has_next)
+        self._rownumber = 0
+
+    def _check_current(self):
+        stream = self._stream
+        if stream._closed:
+            raise err.ProgrammingError("result set iterator is closed")
+        if self._superseded or stream._current is not self:
+            raise err.ProgrammingError("result set is no longer the current result set")
+
+    def _read_row(self):
+        stream = self._stream
+        result = self._result
+        self._check_current()
+        if not result.unbuffered_active:
+            self._finish()
+            return None
+        try:
+            row = result._read_rowdata_packet_unbuffered()
+        except BaseException:
+            stream._fail()
+            raise
+        if row is None:
+            self._finish()
+            return None
+        self._rownumber += 1
+        return self._cursor._conv_row(row)
+
+    def _finish(self):
+        result = self._result
+        self._consumed = True
+        self.warning_count = result.warning_count
+        self.affected_rows = self._rownumber
+        self.rowcount = self._rownumber
+        self.more_results = bool(result.has_next)
+        self._cursor.warning_count = result.warning_count
+
+    def fetchone(self):
+        """Fetch the next row of this result set without advancing sets.
+
+        Returns ``None`` once the result set's EOF has been reached.
+
+        :raise pymysql.err.ProgrammingError: if the owning
+        :class:`ResultSetIterator` has already advanced past this set or
+        has been closed.
+        """
+        if self._superseded:
+            self._check_current()
+        if self._consumed:
+            return None
+        return self._read_row()
+
+    def drain(self):
+        """Read and discard every remaining row of this result set.
+
+        Calling it on an already consumed result set is a no-op.  An error
+        packet received while draining ends this set normally: it is
+        propagated and the connection stays usable.
+
+        :return: The number of rows that were discarded.
+        :rtype: int
+        """
+        stream = self._stream
+        result = self._result
+        if self._superseded:
+            self._check_current()
+        if self._consumed:
+            return 0
+        discarded = 0
+        try:
+            while result.unbuffered_active:
+                packet = result.connection._read_packet()
+                if result._check_packet_is_eof(packet):
+                    result.unbuffered_active = False
+                    result.connection = None
+                    break
+                discarded += 1
+        except BaseException:
+            stream._fail()
+            raise
+        self._rownumber += discarded
+        self._finish()
+        return discarded
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._superseded:
+            self._check_current()
+        if self._consumed:
+            raise StopIteration
+        row = self._read_row()
+        if row is None:
+            raise StopIteration
+        return row
+
+    @property
+    def rownumber(self):
+        """Number of rows read from this result set so far."""
+        return self._rownumber
+
+
+class ResultSetIterator:
+    """Lazily iterate the result sets returned by one query or ``CALL``.
+
+    Returned by :meth:`Cursor.iter_result_sets`.  Every iteration yields the
+    next :class:`ResultSet`, including empty result sets and the trailing
+    empty set produced by a stored-procedure ``CALL``.
+
+    Advancing to the next result set drains the rows of the current one when
+    it was not fully read, so the connection never starts a new command while
+    positioned inside a result set.  As a context manager, leaving the
+    ``with`` block drains all remaining result sets and the connection can
+    then run another query.  If the remaining data cannot be drained safely
+    (for example because the connection was lost), the connection is closed.
+    """
+
+    def __init__(self, cursor, query, args):
+        self._cursor = cursor
+        self._conn = cursor._get_db()
+        self._current = None
+        self._closed = False
+
+        # Match execute(): a statement may only start once all earlier
+        # (unbuffered or multi-statement) result sets have been consumed.
+        while cursor.nextset():
+            pass
+
+        if args is not None:
+            query = cursor._mogrify(query, args)
+        self._query = query
+        try:
+            self._conn.query(query, unbuffered=True)
+        except BaseException:
+            # The first result set already failed (an error packet).  The
+            # server has no pending data, so the connection stays usable.
+            self._conn._result = None
+            self._closed = True
+            raise
+        cursor._do_get_result()
+
+    def _make_current(self):
+        if self._current is not None:
+            self._current._superseded = True
+        result_set = ResultSet(self, self._conn._result)
+        self._current = result_set
+        self._cursor._do_get_result()
+        return result_set
+
+    def _read_next_header(self):
+        """Read the header of the following result set."""
+        conn = self._conn
+        try:
+            conn.next_result(unbuffered=True)
+        except BaseException:
+            self._fail()
+            raise
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        current = self._current
+        if current is not None:
+            if not current._consumed:
+                # Clear contract: drain the current set before reading the
+                # next set's header, so no two sets interleave socket reads.
+                current.drain()
+            if not current.more_results:
+                # EOF of the whole multi-result stream.
+                self._closed = True
+                self._conn._result = None
+                raise StopIteration
+            self._read_next_header()
+        return self._make_current()
+
+    def __iter__(self):
+        return self
+
+    def _abort(self):
+        """Mark the stream dead and close the connection that is out of sync."""
+        self._closed = True
+        conn = self._conn
+        if conn is not None and conn.open:
+            conn._force_close()
+
+    def _fail(self):
+        """End the stream after an error while reading it.
+
+        A server-side error packet ends the statement normally: the server
+        has no more data, so the connection can stay usable.  A transport
+        failure already closed the connection, which cannot be drained and
+        must stay closed.
+        """
+        conn = self._conn
+        conn._result = None
+        if conn.open:
+            self._closed = True
+        else:
+            self._abort()
+
+    def close(self):
+        """Drain every remaining result set.
+
+        The connection is left ready for another query when draining
+        succeeds; if the socket is unusable it is closed instead.
+        """
+        if self._closed:
+            return
+        try:
+            for result_set in self:
+                result_set.drain()
+        except BaseException:
+            self._abort()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_value, traceback
+        if self._closed:
+            return False
+        try:
+            self.close()
+        except BaseException:
+            # Preserve an exception already raised inside the with-block.
+            if exc_type is not None:
+                return False
+            raise
+        return False
+
+
 class Cursor:
     """
     This is the object used to interact with the database.
@@ -103,6 +367,41 @@ class Cursor:
 
     def nextset(self):
         return self._nextset(False)
+
+    def iter_result_sets(self, query, args=None):
+        """Iterate multiple result sets lazily.
+
+        Execute *query* (typically a multi-statement query or a ``CALL`` of a
+        stored procedure) and return a :class:`ResultSetIterator` that yields
+        one :class:`ResultSet` per result set.  Rows are read from the server
+        on demand rather than buffered, so skipping a result set does not
+        pull its rows into memory.
+
+        Advancing past a result set that was not fully read drains its
+        remaining rows first.  Two result sets never hold active row
+        iterators at once: iterating an older result set once the stream has
+        advanced raises :class:`~pymysql.err.ProgrammingError`.
+
+        The returned object is a context manager.  Leaving the ``with``
+        block drains every remaining result set, after which this cursor's
+        connection can execute another query.  If draining is impossible
+        because the connection was lost, the connection is closed::
+
+            with cur.iter_result_sets("CALL my_proc()") as sets:
+                for result_set in sets:
+                    for row in result_set:
+                        process(row)
+            cur.execute("SELECT 1")
+
+        :param query: Query to execute.
+        :type query: str
+
+        :param args: Parameters used with the query. (optional)
+        :type args: tuple, list or dict
+
+        :rtype: ResultSetIterator
+        """
+        return ResultSetIterator(self, query, args)
 
     def _mogrify(self, query, args) -> str:
         """Return query after binding args."""
