@@ -342,6 +342,9 @@ class Connection:
         self._result = None
         self._affected_rows = 0
         self.host_info = "Not connected"
+        # Incremented on every (re)connect; server-side prepared statements
+        # are only valid for the connection generation that created them.
+        self._generation = 0
 
         # specified autocommit mode. None means use server default.
         self.autocommit_mode = autocommit
@@ -571,6 +574,21 @@ class Connection:
             return cursor(self)
         return self.cursorclass(self)
 
+    def prepare(self, sql):
+        """Prepare a SQL statement on the server and return a handle.
+
+        The returned :py:class:`~pymysql.prepared.PreparedStatement` can be
+        executed multiple times with different parameters and should be
+        closed explicitly when no longer needed. The statement is bound to
+        this connection generation: reconnecting invalidates it.
+        """
+        from .prepared import PreparedStatement
+
+        if isinstance(sql, str):
+            sql = sql.encode(self.encoding)
+        self._execute_command(COMMAND.COM_STMT_PREPARE, sql)
+        return PreparedStatement._read_prepare_response(self)
+
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
         # if DEBUG:
@@ -662,6 +680,7 @@ class Connection:
 
     def connect(self, sock=None):
         self._closed = False
+        self._generation += 1
         try:
             if sock is None:
                 if self.unix_socket:

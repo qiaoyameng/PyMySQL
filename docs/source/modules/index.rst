@@ -12,3 +12,4 @@ For more information, please read the `Python Database API specification
 
   connections
   cursors
+  prepared

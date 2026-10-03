@@ -77,6 +77,7 @@ apilevel = "2.0"
 paramstyle = "pyformat"
 
 from . import connections
+from .prepared import PreparedStatement
 
 
 class DBAPISet(frozenset):
@@ -162,6 +163,7 @@ __all__ = [
     "MySQLError",
     "NotSupportedError",
     "OperationalError",
+    "PreparedStatement",
     "ProgrammingError",
     "Time",
     "TimeFromTicks",
