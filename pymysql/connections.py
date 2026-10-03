@@ -125,6 +125,21 @@ class Connection:
         Conversion dictionary to use instead of the default one.
         This is used to provide custom marshalling and unmarshalling of types.
         See converters.
+    :param column_decoder:
+        Optional callable selecting a decoder from column metadata instead of
+        the type code alone. It is called once per column for each result set
+        with a ``converters.ColumnInfo`` instance and must return a decoder
+        callable, ``None`` to fall back to the type-based ``conv`` decoders,
+        or ``converters.through`` to leave the column unconverted.
+        Can be overridden per cursor via the cursor's ``column_decoder``
+        attribute.
+    :param conversion_error_policy:
+        What to do when a decoder raises while reading a row.
+        ``"raise"`` (the default) propagates the exception. ``"keep_raw"``
+        keeps the raw (decoded) value for the column and records a
+        ``converters.ColumnConversionError`` in ``cursor.conversion_errors``.
+        Can be overridden per cursor via the cursor's
+        ``conversion_error_policy`` attribute.
     :param use_unicode:
         Whether or not to default to unicode strings.
         This option defaults to true.
@@ -196,6 +211,8 @@ class Connection:
         read_default_group=None,
         autocommit=False,
         local_infile=False,
+        column_decoder=None,
+        conversion_error_policy=converters.CONVERT_RAISE,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
         auth_plugin_map=None,
@@ -352,6 +369,16 @@ class Connection:
         # Need for MySQLdb compatibility.
         self.encoders = {k: v for (k, v) in conv.items() if type(k) is not int}
         self.decoders = {k: v for (k, v) in conv.items() if type(k) is int}
+        if conversion_error_policy not in converters.CONVERT_ERROR_POLICIES:
+            raise ValueError(
+                "conversion_error_policy should be one of"
+                f" {converters.CONVERT_ERROR_POLICIES}"
+            )
+        self.column_decoder = column_decoder
+        self.conversion_error_policy = conversion_error_policy
+        # Per-cursor overrides, set by Cursor._query() before each query.
+        self._cursor_column_decoder = None
+        self._cursor_conversion_error_policy = None
         self.sql_mode = sql_mode
         self.init_command = init_command
         self.max_allowed_packet = max_allowed_packet
@@ -570,6 +597,18 @@ class Connection:
         if cursor:
             return cursor(self)
         return self.cursorclass(self)
+
+    def _effective_column_decoder(self):
+        return (
+            self._cursor_column_decoder
+            if self._cursor_column_decoder is not None
+            else self.column_decoder
+        )
+
+    def _effective_conversion_error_policy(self):
+        if self._cursor_conversion_error_policy is not None:
+            return self._cursor_conversion_error_policy
+        return self.conversion_error_policy
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
@@ -1280,6 +1319,8 @@ class MySQLResult:
         self.rows = None
         self.has_next = None
         self.unbuffered_active = False
+        self.conversion_errors = []
+        self._conversion_error_policy = converters.CONVERT_RAISE
 
     def __del__(self):
         if self.unbuffered_active:
@@ -1428,7 +1469,7 @@ class MySQLResult:
 
     def _read_row_from_packet(self, packet):
         row = []
-        for encoding, converter in self.converters:
+        for column_index, (encoding, converter) in enumerate(self.converters):
             try:
                 data = packet.read_length_coded_string()
             except IndexError:
@@ -1441,20 +1482,33 @@ class MySQLResult:
                 if DEBUG:
                     print("DEBUG: DATA = ", data)
                 if converter is not None:
-                    data = converter(data)
+                    try:
+                        data = converter(data)
+                    except Exception as e:
+                        if self._conversion_error_policy == converters.CONVERT_RAISE:
+                            raise
+                        self._record_conversion_error(column_index, e)
             row.append(data)
         return tuple(row)
+
+    def _record_conversion_error(self, column_index, error):
+        column = converters.ColumnInfo(column_index, self.fields[column_index])
+        self.conversion_errors.append(converters.ColumnConversionError(column, error))
 
     def _get_descriptions(self):
         """Read a column descriptor packet for each column in the result."""
         self.fields = []
         self.converters = []
-        use_unicode = self.connection.use_unicode
-        conn_encoding = self.connection.encoding
+        self.conversion_errors = []
+        conn = self.connection
+        use_unicode = conn.use_unicode
+        conn_encoding = conn.encoding
+        selector = conn._effective_column_decoder()
+        self._conversion_error_policy = conn._effective_conversion_error_policy()
         description = []
 
         for i in range(self.field_count):
-            field = self.connection._read_packet(FieldDescriptorPacket)
+            field = conn._read_packet(FieldDescriptorPacket)
             self.fields.append(field)
             description.append(field.description())
             field_type = field.type_code
@@ -1477,14 +1531,22 @@ class MySQLResult:
                     encoding = "ascii"
             else:
                 encoding = None
-            converter = self.connection.decoders.get(field_type)
+            if selector is not None:
+                # The selector is consulted once per column for each result
+                # set. Returning None falls back to the type-based decoders;
+                # returning converters.through disables conversion entirely.
+                converter = selector(converters.ColumnInfo(i, field))
+            else:
+                converter = None
+            if converter is None:
+                converter = conn.decoders.get(field_type)
             if converter is converters.through:
                 converter = None
             if DEBUG:
                 print(f"DEBUG: field={field}, converter={converter}")
             self.converters.append((encoding, converter))
 
-        eof_packet = self.connection._read_packet()
+        eof_packet = conn._read_packet()
         assert eof_packet.is_eof_packet(), "Protocol error, expecting EOF"
         self.description = tuple(description)
 

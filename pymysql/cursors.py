@@ -38,6 +38,14 @@ class Cursor:
     #: Default value of max_allowed_packet is 1048576.
     max_stmt_length = 1024000
 
+    #: Per-cursor override of the connection's ``column_decoder`` selector.
+    #: None (the default) means the connection's selector is used.
+    column_decoder = None
+
+    #: Per-cursor override of the connection's ``conversion_error_policy``.
+    #: None (the default) means the connection's policy is used.
+    conversion_error_policy = None
+
     def __init__(self, connection):
         self.connection = connection
         self.warning_count = 0
@@ -48,6 +56,7 @@ class Cursor:
         self._executed = None
         self._result = None
         self._rows = None
+        self.conversion_errors = []
 
     def close(self):
         """
@@ -332,9 +341,16 @@ class Cursor:
     def _query(self, q):
         conn = self._get_db()
         self._clear_result()
+        self._apply_cursor_options(conn)
         conn.query(q)
         self._do_get_result()
         return self.rowcount
+
+    def _apply_cursor_options(self, conn):
+        # The connection serves one query at a time, so the per-cursor
+        # overrides are pushed onto it right before the query is sent.
+        conn._cursor_column_decoder = self.column_decoder
+        conn._cursor_conversion_error_policy = self.conversion_error_policy
 
     def _clear_result(self):
         self.rownumber = 0
@@ -345,6 +361,7 @@ class Cursor:
         self.description = None
         self.lastrowid = None
         self._rows = None
+        self.conversion_errors = []
 
     def _do_get_result(self):
         conn = self._get_db()
@@ -356,6 +373,9 @@ class Cursor:
         self.description = result.description
         self.lastrowid = result.insert_id
         self._rows = result.rows
+        # Share the list with the result so that conversion problems found
+        # while streaming rows (unbuffered cursors) show up here too.
+        self.conversion_errors = result.conversion_errors
 
     def __iter__(self):
         return self
@@ -433,6 +453,7 @@ class SSCursor(Cursor):
     def _query(self, q):
         conn = self._get_db()
         self._clear_result()
+        self._apply_cursor_options(conn)
         conn.query(q, unbuffered=True)
         self._do_get_result()
         return self.rowcount

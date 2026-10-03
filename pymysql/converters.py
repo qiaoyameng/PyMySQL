@@ -310,6 +310,105 @@ def through(x):
     return x
 
 
+#: Conversion error policy: let decoder exceptions propagate to the caller.
+CONVERT_RAISE = "raise"
+
+#: Conversion error policy: keep the raw (decoded) value for the column and
+#: record a :class:`ColumnConversionError` on the result instead of raising.
+CONVERT_KEEP_RAW = "keep_raw"
+
+#: Valid values for the ``conversion_error_policy`` option.
+CONVERT_ERROR_POLICIES = (CONVERT_RAISE, CONVERT_KEEP_RAW)
+
+
+class ColumnInfo:
+    """Column metadata handed to column decoder selectors.
+
+    A selector registered via the ``column_decoder`` connection option (or
+    the per-cursor ``column_decoder`` attribute) is called once per column
+    for each result set with an instance of this class, and must return a
+    decoder callable, ``None`` to fall back to the type-based decoders, or
+    :func:`through` to leave the column unconverted.
+
+    Decoders receive the value *after* text decoding: ``str`` for textual
+    columns, ``bytes`` for binary columns. ``NULL`` values are never passed
+    to decoders and always come back as ``None``.
+    """
+
+    __slots__ = (
+        "index",
+        "name",
+        "org_name",
+        "table_name",
+        "org_table",
+        "type_code",
+        "flags",
+        "charsetnr",
+        "length",
+        "scale",
+    )
+
+    def __init__(self, index, field):
+        #: Column position in the result set, starting at 0.
+        self.index = index
+        #: Column name (or alias) in the result set.
+        self.name = field.name
+        #: Original column name in the source table.
+        self.org_name = field.org_name
+        #: Table name (or alias) the column comes from.
+        self.table_name = field.table_name
+        #: Original table name the column comes from.
+        self.org_table = field.org_table
+        #: MySQL type code, see ``pymysql.constants.FIELD_TYPE``.
+        self.type_code = field.type_code
+        #: Column flags, see ``pymysql.constants.FLAG``.
+        self.flags = field.flags
+        #: Character set number of the column (63 means binary).
+        self.charsetnr = field.charsetnr
+        #: Maximum length of the column as reported by the server.
+        self.length = field.length
+        #: Number of decimals for numeric types.
+        self.scale = field.scale
+
+    def __repr__(self):
+        return (
+            f"ColumnInfo(index={self.index}, name={self.name!r}, "
+            f"org_name={self.org_name!r}, table_name={self.table_name!r}, "
+            f"org_table={self.org_table!r}, type_code={self.type_code}, "
+            f"flags={self.flags}, charsetnr={self.charsetnr}, "
+            f"length={self.length}, scale={self.scale})"
+        )
+
+
+class ColumnConversionError:
+    """Record of a column-level conversion failure.
+
+    Created when the ``"keep_raw"`` conversion error policy is in effect and
+    a decoder raises. Only column metadata and the original exception are
+    kept -- never row values -- so records are safe to log without leaking
+    secret data from the rest of the row.
+    """
+
+    __slots__ = ("column", "error")
+
+    def __init__(self, column, error):
+        #: :class:`ColumnInfo` of the column that failed to convert.
+        self.column = column
+        #: The exception raised by the decoder.
+        self.error = error
+
+    def __str__(self):
+        return (
+            f"conversion failed for column {self.column.index} "
+            f"({self.column.table_name}.{self.column.name}, "
+            f"type_code={self.column.type_code}): "
+            f"{type(self.error).__name__}"
+        )
+
+    def __repr__(self):
+        return f"ColumnConversionError(column={self.column!r}, error={self.error!r})"
+
+
 # def convert_bit(b):
 #    b = "\x00" * (8 - len(b)) + b # pad w/ zeroes
 #    return struct.unpack(">Q", b)[0]

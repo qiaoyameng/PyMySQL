@@ -1,5 +1,23 @@
 # Changes
 
+## Unreleased
+
+Added a column-metadata based decoder selection extension point:
+
+* New `column_decoder` connection option: a callable receiving a
+  `pymysql.converters.ColumnInfo` (column index, name, original name, source
+  table, flags, charset, type code, ...) once per column for each result set.
+  It returns a decoder, `None` to fall back to the type-based `conv` decoders,
+  or `pymysql.converters.through` to leave the column unconverted.
+  This makes it possible to decode two columns sharing a type code (e.g.
+  DECIMAL amounts vs. ratios) to different Python types.
+* Cursors can override the connection defaults per cursor via the
+  `column_decoder` and `conversion_error_policy` attributes.
+* New `conversion_error_policy` connection option: `"raise"` (default)
+  propagates decoder exceptions; `"keep_raw"` keeps the raw (decoded) value
+  and records a `pymysql.converters.ColumnConversionError` (column metadata
+  only, never row data) in `cursor.conversion_errors`.
+
 ## v1.2.3
 
 Release date: 2026-09-17
