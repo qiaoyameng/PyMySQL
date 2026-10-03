@@ -1,3 +1,4 @@
+import contextlib
 import re
 import warnings
 
@@ -40,6 +41,9 @@ class Cursor:
 
     def __init__(self, connection):
         self.connection = connection
+        cursors = getattr(connection, "_cursors", None)
+        if cursors is not None:
+            cursors.add(self)
         self.warning_count = 0
         self.description = None
         self.rownumber = 0
@@ -60,7 +64,24 @@ class Cursor:
             while self.nextset():
                 pass
         finally:
-            self.connection = None
+            self._invalidate()
+
+    def _invalidate(self):
+        conn = self.connection
+        cursors = getattr(conn, "_cursors", None)
+        if cursors is not None:
+            with contextlib.suppress(KeyError):
+                cursors.remove(self)
+        self.connection = None
+        self._executed = None
+        self._result = None
+        self._rows = None
+        self.description = None
+        self._fields = None
+        self.lastrowid = None
+        self.rownumber = 0
+        self.rowcount = -1
+        self.warning_count = 0
 
     def __enter__(self):
         return self
@@ -75,6 +96,7 @@ class Cursor:
         return self.connection
 
     def _check_executed(self):
+        self._get_db()
         if not self._executed:
             raise err.ProgrammingError("execute() first")
 
@@ -426,7 +448,7 @@ class SSCursor(Cursor):
             while self.nextset():
                 pass
         finally:
-            self.connection = None
+            self._invalidate()
 
     __del__ = close
 

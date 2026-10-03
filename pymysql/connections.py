@@ -12,6 +12,7 @@ import struct
 import sys
 import traceback
 import warnings
+import weakref
 
 from . import VERSION_STRING, _auth, converters, err
 from .charset import charset_by_id, charset_by_name
@@ -341,6 +342,7 @@ class Connection:
 
         self._result = None
         self._affected_rows = 0
+        self._cursors = weakref.WeakSet()
         self.host_info = "Not connected"
 
         # specified autocommit mode. None means use server default.
@@ -570,6 +572,54 @@ class Connection:
         if cursor:
             return cursor(self)
         return self.cursorclass(self)
+
+    def reset_session(self):
+        """Reset the server session and restore connection configuration."""
+        try:
+            self._drain_query_results()
+            self._invalidate_cursors()
+
+            self._execute_command(COMMAND.COM_RESET_CONNECTION, b"")
+            self._read_ok_packet()
+
+            self._restore_session_state()
+        except BaseException:
+            result = self._result
+            if result is not None:
+                result.unbuffered_active = False
+                result.connection = None
+                self._result = None
+            self._invalidate_cursors()
+            self._force_close()
+            raise
+
+    def _drain_query_results(self):
+        if self._result is None:
+            return
+
+        result = self._result
+        unbuffered = result.unbuffered_active
+        if result.unbuffered_active:
+            warnings.warn("Previous unbuffered result was left incomplete")
+            result._finish_unbuffered_query()
+
+        while self._result is not None and self._result.has_next:
+            self.next_result(unbuffered=unbuffered)
+
+        self._result = None
+        self._affected_rows = 0
+
+    def _invalidate_cursors(self):
+        for cursor in tuple(self._cursors):
+            cursor._invalidate()
+        self._cursors = weakref.WeakSet()
+
+    def _restore_session_state(self):
+        self.set_character_set(self.charset, self.collation)
+        if self.init_command is not None:
+            self.query(self.init_command)
+        if self.autocommit_mode is not None:
+            self.autocommit(self.autocommit_mode)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
