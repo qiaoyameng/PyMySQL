@@ -38,6 +38,15 @@ class Cursor:
     #: Default value of max_allowed_packet is 1048576.
     max_stmt_length = 1024000
 
+    #: Column decoder selector overriding the connection's one for this
+    #: cursor. None means use the connection's ``column_decoder_selector``.
+    #: See ``pymysql.connections.Connection``.
+    column_decoder_selector = None
+
+    #: Conversion error policy overriding the connection's one for this
+    #: cursor. None means use the connection's ``conversion_error_policy``.
+    conversion_error_policy = None
+
     def __init__(self, connection):
         self.connection = connection
         self.warning_count = 0
@@ -48,6 +57,9 @@ class Cursor:
         self._executed = None
         self._result = None
         self._rows = None
+        #: Column conversion problems recorded while fetching the current
+        #: statement's results when conversion_error_policy is "keep".
+        self.column_conversion_problems = []
 
     def close(self):
         """
@@ -332,6 +344,9 @@ class Cursor:
     def _query(self, q):
         conn = self._get_db()
         self._clear_result()
+        self.column_conversion_problems = []
+        conn._active_column_decoder_selector = self.column_decoder_selector
+        conn._active_conversion_error_policy = self.conversion_error_policy
         conn.query(q)
         self._do_get_result()
         return self.rowcount
@@ -356,6 +371,10 @@ class Cursor:
         self.description = result.description
         self.lastrowid = result.insert_id
         self._rows = result.rows
+        # Share the problem list with the result so that problems found
+        # while streaming rows (SSCursor) are recorded on the cursor too.
+        self.column_conversion_problems.extend(result.column_problems)
+        result.column_problems = self.column_conversion_problems
 
     def __iter__(self):
         return self
@@ -433,6 +452,9 @@ class SSCursor(Cursor):
     def _query(self, q):
         conn = self._get_db()
         self._clear_result()
+        self.column_conversion_problems = []
+        conn._active_column_decoder_selector = self.column_decoder_selector
+        conn._active_conversion_error_policy = self.conversion_error_policy
         conn.query(q, unbuffered=True)
         self._do_get_result()
         return self.rowcount

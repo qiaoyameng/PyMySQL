@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import datetime
 import re
 import time
 import warnings
 from decimal import Decimal
+from typing import NamedTuple
 
 from .constants import FIELD_TYPE
 from .err import ProgrammingError
@@ -372,3 +375,102 @@ conversions.update(decoders)
 Thing2Literal = escape_str
 
 # Run doctests with `pytest --doctest-modules pymysql/converters.py`
+
+
+#: Conversion failure policy: raise ColumnConversionError.
+CONVERSION_RAISE = "raise"
+
+#: Conversion failure policy: keep the unconverted value and record a
+#: ColumnConversionProblem on the cursor.
+CONVERSION_KEEP = "keep"
+
+#: Valid values for the conversion_error_policy option.
+CONVERSION_ERROR_POLICIES = (CONVERSION_RAISE, CONVERSION_KEEP)
+
+
+class ColumnMetadata(NamedTuple):
+    """Metadata of a single result column.
+
+    An instance of this class is passed to the column decoder selector
+    (see ``column_decoder_selector`` of :class:`pymysql.connections.Connection`)
+    exactly once per column per result set.
+
+    The decoding pipeline for each non-NULL value is, in order:
+
+    1. The raw bytes are read from the row packet.
+    2. If ``encoding`` is not None, the bytes are decoded to ``str``
+       (text columns). Binary columns (charset 63) stay ``bytes``.
+    3. The selected converter is called with that value.
+
+    NULL values are always returned as None; converters are never
+    called for them.
+    """
+
+    #: Zero-based position of the column within the result set.
+    index: int
+    #: Column name (or alias) as it appears in the result set.
+    name: str
+    #: Original column name in the table (empty for expressions/aliases).
+    org_name: str
+    #: Table name (or alias) the column comes from.
+    table_name: str
+    #: Original table name the column comes from.
+    org_table: str
+    #: MySQL type code, see ``pymysql.constants.FIELD_TYPE``.
+    type_code: int
+    #: Column flags, see ``pymysql.constants.FLAG``.
+    flags: int
+    #: Character set number. 63 means binary (no decoding is applied).
+    charsetnr: int
+    #: Column length as reported by the server.
+    length: int
+    #: Number of decimals for numeric types.
+    scale: int
+    #: Encoding applied to the raw bytes before the converter is called,
+    #: or None when the converter receives ``bytes``.
+    encoding: str | None
+
+
+class ColumnConversionError(Exception):
+    """Raised when a column decoder fails to convert a value.
+
+    The message intentionally contains only column metadata -- never row
+    values -- so it is safe to log. The original exception is available
+    as ``error`` (and as ``__cause__``).
+    """
+
+    def __init__(self, column: ColumnMetadata, error: Exception):
+        self.column = column
+        self.error = error
+        super().__init__(
+            f"failed to convert column {column.index} "
+            f"({column.table_name!r}.{column.name!r}, "
+            f"type_code={column.type_code}): {type(error).__name__}"
+        )
+
+
+class ColumnConversionProblem:
+    """Record of a single column conversion failure.
+
+    Created when ``conversion_error_policy`` is "keep" and a column
+    decoder raises. The unconverted value is returned in the row; this
+    record intentionally does not store it, so logged problems never
+    contain row data.
+    """
+
+    __slots__ = ("column", "error", "row_number")
+
+    def __init__(self, column: ColumnMetadata, error: Exception, row_number: int):
+        #: Metadata of the column that failed to convert.
+        self.column = column
+        #: The exception raised by the converter.
+        self.error = error
+        #: Zero-based row number within the result set.
+        self.row_number = row_number
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(column={self.column.index} "
+            f"name={self.column.name!r} row={self.row_number} "
+            f"error={type(self.error).__name__})"
+        )

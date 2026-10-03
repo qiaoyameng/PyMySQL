@@ -1,5 +1,22 @@
 # Changes
 
+## Unreleased
+
+Added a column-metadata based decoder extension point. The new
+`column_decoder_selector` connection option (and the per-cursor override of
+the same name) is called once per column per result set with a
+`pymysql.converters.ColumnMetadata` instance (column index, name, original
+name, source table, flags, charset and type code) and may return a custom
+decoder, e.g. to decode two DECIMAL columns differently. Converters are bound
+per column position, so same-named columns never share a converter.
+
+The new `conversion_error_policy` option selects what happens when a column
+decoder fails: `"raise"` (default) raises
+`pymysql.converters.ColumnConversionError`, `"keep"` returns the unconverted
+value and records a `pymysql.converters.ColumnConversionProblem` on
+`cursor.column_conversion_problems`. Error details only contain column
+metadata, never row values.
+
 ## v1.2.3
 
 Release date: 2026-09-17
