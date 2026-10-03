@@ -9,3 +9,9 @@ Connection Object
                      IntegrityError, InternalError, NotSupportedError,
                      OperationalError, ProgrammingError, Warning,
                      escape, literal, write_packet
+
+.. autoclass:: ResultSetStream
+   :members:
+
+.. autoclass:: StreamedResultSet
+   :members:

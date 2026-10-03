@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+Added `Connection.query_iter()`, an explicit, lazy result-set iteration
+interface for queries returning multiple result sets (multi-statements and
+stored procedures). Each yielded `StreamedResultSet` exposes the set's
+metadata (`description`, `affected_rows`, `warning_count`, `insert_id`,
+`server_status`, `has_next`) and a lazy `rows()` iterator, so trailing
+empty sets can no longer be missed and rows are never buffered in memory
+as a whole. Advancing the stream drains an unfinished set; the connection
+is ready for the next query once the stream is exhausted or closed.
+
 ## v1.2.3
 
 Release date: 2026-09-17

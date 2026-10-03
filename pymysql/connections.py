@@ -585,6 +585,29 @@ class Connection:
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
         return self._affected_rows
 
+    def query_iter(self, sql):
+        """
+        Execute a query and return an iterator over its result sets.
+
+        Unlike :meth:`Cursor.nextset`, every result set produced by the
+        query is yielded exactly once, including trailing empty (OK) sets
+        which are easy to miss with the nextset()/fetch() idiom.
+
+        Rows are read lazily from the socket, one packet at a time, so
+        large result sets are never buffered in memory in their entirety.
+
+        The returned :class:`ResultSetStream` should be used as a context
+        manager. See its documentation for the iteration contract.
+
+        To receive more than one result set, the connection must be made
+        with ``client_flag=CLIENT.MULTI_STATEMENTS`` (or the query must be
+        a stored procedure call).
+        """
+        if isinstance(sql, str):
+            sql = sql.encode(self.encoding)
+        self._execute_command(COMMAND.COM_QUERY, sql)
+        return ResultSetStream(self)
+
     def affected_rows(self):
         return self._affected_rows
 
@@ -1364,6 +1387,7 @@ class MySQLResult:
         #    use OKPacketWrapper instead of EOFPacketWrapper
         wp = EOFPacketWrapper(packet)
         self.warning_count = wp.warning_count
+        self.server_status = wp.server_status
         self.has_next = wp.has_next
         return True
 
@@ -1487,6 +1511,310 @@ class MySQLResult:
         eof_packet = self.connection._read_packet()
         assert eof_packet.is_eof_packet(), "Protocol error, expecting EOF"
         self.description = tuple(description)
+
+
+def _is_server_error_packet(exc):
+    """Return True if *exc* was raised from a server ERR packet.
+
+    Server ERR packets abort the current query batch but leave the
+    connection in sync, unlike client-side (CR_*) errors which indicate
+    the connection itself is broken.
+    """
+    if getattr(exc, "sqlstate", None) is not None:
+        # Only exceptions parsed from a server ERR packet carry a
+        # SQLSTATE; client-side errors are raised without one.
+        return True
+    return (
+        isinstance(exc, err.MySQLError)
+        and exc.args
+        and isinstance(exc.args[0], int)
+        and exc.args[0] < CR.CR_ERROR_FIRST
+    )
+
+
+class ResultSetStream:
+    """Lazy iterator over the result sets of a single query.
+
+    Returned by :meth:`Connection.query_iter`. Iterating yields one
+    :class:`StreamedResultSet` per result set produced by the query --
+    including empty (OK) sets, which carry no rows but do carry
+    ``affected_rows``, ``warning_count`` and ``server_status``.
+
+    Iteration contract:
+
+    * Each yielded set offers metadata and a lazy row iterator,
+      :meth:`StreamedResultSet.rows`. Rows are read from the socket on
+      demand; they are never buffered in memory as a whole.
+    * Advancing the outer iterator while the current set's rows have not
+      been fully consumed *drains* (reads and discards) the remaining
+      rows of that set first. A row iterator of a previous set can
+      therefore never interleave with the current one on the socket.
+    * If the server sends an ERR packet while a set is being read, the
+      corresponding exception is raised from that set's row iterator (or
+      from :meth:`__next__` if it happens between sets) and is also
+      recorded on the set's ``error`` attribute. The stream is then
+      finished; the connection itself stays usable.
+    * Once the stream is exhausted or :meth:`close` was called, the
+      connection is ready for the next query. If the remaining data
+      cannot be drained safely, the connection is closed instead.
+
+    Issuing another query on the same connection invalidates the stream;
+    it terminates silently from that point on.
+    """
+
+    def __init__(self, connection):
+        self._conn = connection
+        self._current = None
+        self._index = -1
+        self._finished = False
+        #: Exception that terminated the stream (a server ERR packet or
+        #: a connection failure), or None.
+        self.error = None
+        #: Index of the result set the terminating error belongs to.
+        self.error_index = None
+
+    def __iter__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    def __next__(self):
+        if self._finished:
+            raise StopIteration
+        current = self._current
+        if current is None:
+            if self._conn._result is not None:
+                # The connection was reused before the stream was consumed.
+                self._finished = True
+                raise StopIteration
+        else:
+            if self._conn._result is not current._result:
+                # The connection was reused; this stream is stale.
+                self._finished = True
+                raise StopIteration
+            if not current.exhausted:
+                # Contract: advancing drains the unread rows of the
+                # current set. A server ERR packet found while draining
+                # aborts the whole batch; it is recorded on the set and
+                # re-raised to the caller.
+                current._drain()
+            if not current.has_next:
+                self._finished = True
+                raise StopIteration
+        result = MySQLResult(self._conn)
+        try:
+            result.init_unbuffered_query()
+        except Exception as e:
+            # An ERR packet (or a lost connection) while reading the set
+            # header aborts the whole batch: the stream is over. The
+            # connection stays usable after a server ERR packet; a broken
+            # socket was already closed by Connection._read_packet().
+            self._finished = True
+            self._conn._result = None
+            self.error = e
+            self.error_index = self._index + 1
+            raise
+        self._conn._result = result
+        if result.server_status is not None:
+            self._conn.server_status = result.server_status
+        self._index += 1
+        self._current = StreamedResultSet(self, result, self._index)
+        return self._current
+
+    def close(self):
+        """Stop iterating and make the connection ready for the next query.
+
+        Unread rows of the current set and any remaining result sets are
+        drained and discarded. If the remaining data cannot be drained
+        safely, the connection is closed.
+        """
+        if self._finished:
+            return
+        self._finished = True
+        conn = self._conn
+        current = self._current
+        if current is None:
+            if conn._result is not None:
+                # The connection was reused before the stream was
+                # consumed; there is nothing safe left to drain.
+                return
+        elif conn._result is not current._result:
+            # The connection was reused; this stream is stale.
+            return
+        try:
+            if current is not None and not current.exhausted:
+                current._drain()
+            result = conn._result
+            while result is None or result.has_next:
+                conn.next_result()
+                result = conn._result
+        except Exception as e:
+            if _is_server_error_packet(e):
+                # The server aborted the batch; the connection is in
+                # sync and ready for the next query.
+                return
+            # Cannot safely drain: drop the connection.
+            conn._force_close()
+            raise
+        finally:
+            result = conn._result
+            if result is not None:
+                result.unbuffered_active = False
+                result.connection = None
+                conn._result = None
+
+
+class StreamedResultSet:
+    """One result set within a :class:`ResultSetStream`.
+
+    Metadata (``description``, ``affected_rows``, ``warning_count``,
+    ``insert_id``, ``server_status``, ``message``, ``has_next``) reflects
+    the underlying protocol packets. ``warning_count`` and
+    ``server_status`` of a row-bearing set are only final once the set is
+    exhausted. ``has_next`` reports the server's more-results status flag
+    and is final once the set is exhausted (immediately for OK sets).
+    """
+
+    def __init__(self, stream, result, index):
+        self._stream = stream
+        self._result = result
+        #: 0-based position of this set within the query's results.
+        self.index = index
+        #: Exception raised by a server ERR packet while reading this
+        #: set, or None.
+        self.error = None
+        self._rows_read = 0
+        self._exhausted = not result.unbuffered_active
+
+    def __repr__(self):
+        return f"<StreamedResultSet index={self.index} exhausted={self._exhausted}>"
+
+    @property
+    def description(self):
+        """Column description tuple, or None for non-row (OK) sets."""
+        return self._result.description
+
+    @property
+    def affected_rows(self):
+        """Affected rows for OK sets; rows consumed so far for row sets."""
+        if self._result.field_count:
+            return self._rows_read
+        return self._result.affected_rows
+
+    @property
+    def insert_id(self):
+        return self._result.insert_id
+
+    @property
+    def warning_count(self):
+        return self._result.warning_count
+
+    @property
+    def server_status(self):
+        return self._result.server_status
+
+    @property
+    def message(self):
+        return self._result.message
+
+    @property
+    def has_next(self):
+        """True if the server flagged that another result set follows."""
+        return bool(self._result.has_next)
+
+    @property
+    def exhausted(self):
+        """True once all rows of this set have been read or drained."""
+        return self._exhausted
+
+    def rows(self):
+        """Return a lazy iterator over the rows of this set.
+
+        May only be iterated while this set is the stream's current set;
+        advancing the stream drains and invalidates it.
+        """
+        if self._stream._current is not self:
+            raise RuntimeError(
+                "Cannot read rows of a result set after the stream advanced"
+            )
+        return self._row_generator()
+
+    def __iter__(self):
+        return self.rows()
+
+    def _row_generator(self):
+        result = self._result
+        try:
+            while result.unbuffered_active:
+                row = result._read_rowdata_packet_unbuffered()
+                if row is None:
+                    break
+                self._rows_read += 1
+                yield row
+        except Exception as e:
+            self._abort(e)
+            raise
+        self._mark_exhausted()
+
+    def _drain(self):
+        """Read and discard the remaining rows of this set."""
+        if self._exhausted:
+            return
+        result = self._result
+        try:
+            while result.unbuffered_active:
+                try:
+                    packet = result.connection._read_packet()
+                except err.OperationalError as e:
+                    if e.args[0] in (
+                        ER.QUERY_TIMEOUT,
+                        ER.STATEMENT_TIMEOUT,
+                    ):
+                        # The query timed out; no more data is coming.
+                        result.unbuffered_active = False
+                        result.connection = None
+                        break
+                    raise
+                if result._check_packet_is_eof(packet):
+                    result.unbuffered_active = False
+                    result.connection = None
+                else:
+                    self._rows_read += 1
+        except Exception as e:
+            self._abort(e)
+            raise
+        self._mark_exhausted()
+
+    def _mark_exhausted(self):
+        self._exhausted = True
+        result = self._result
+        if result.server_status is not None:
+            conn = self._stream._conn
+            if conn._result is result:
+                conn.server_status = result.server_status
+
+    def _abort(self, exc):
+        # An ERR packet (or a lost connection) while reading this set
+        # aborts the whole batch: the stream ends here and the error is
+        # attributed to this set.
+        self.error = exc
+        self._exhausted = True
+        self._stream._finished = True
+        self._stream.error = exc
+        self._stream.error_index = self.index
+        result = self._result
+        result.unbuffered_active = False
+        result.connection = None
+        conn = self._stream._conn
+        if conn._result is result:
+            conn._result = None
+        if not _is_server_error_packet(exc):
+            conn._force_close()
 
 
 def _send_local_file(filename: str, conn: Connection):
